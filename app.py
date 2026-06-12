@@ -83,7 +83,7 @@ with st.sidebar:
     st.caption("Interface unifiée des scripts `animaux` & `copie_nas`")
     page = st.radio(
         "Navigation",
-        ["📋 Nouvelle interface", "⌨️ Ancienne interface", "ⓘ À propos"],
+        ["⌨️ Ancienne interface", "📋 Nouvelle interface", "ⓘ À propos"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -495,8 +495,8 @@ def page_about():
 
 
 PAGES = {
-    "📋 Nouvelle interface": page_workflow,
     "⌨️ Ancienne interface": page_cli,
+    "📋 Nouvelle interface": page_workflow,
     "ⓘ À propos": page_about,
 }
 
