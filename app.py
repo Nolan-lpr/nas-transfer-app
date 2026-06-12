@@ -19,6 +19,33 @@ from core.dicom_reader import first_dicom_in, read_meta
 from core.dicom_transfer import transfer_to_nas
 
 
+def check_patient_names(source_dir: Path, animals: list[str]) -> list[dict]:
+    """Pour chaque animal, lit le PatientName du premier DICOM trouvé et compare."""
+    results = []
+    for a in animals:
+        match = next(
+            (p for p in source_dir.iterdir()
+             if p.is_dir() and p.name.lower().startswith(a.lower() + "_")),
+            None,
+        )
+        if match is None:
+            results.append({"Animal": a, "Premier dossier": "(introuvable)", "PatientName DICOM": "—", "OK ?": "❌"})
+            continue
+        dcm = first_dicom_in(match)
+        if dcm is None:
+            results.append({"Animal": a, "Premier dossier": match.name, "PatientName DICOM": "(pas de DICOM)", "OK ?": "❌"})
+            continue
+        meta = read_meta(dcm)
+        ok = meta.patient_name == a
+        results.append({
+            "Animal": a,
+            "Premier dossier": match.name,
+            "PatientName DICOM": meta.patient_name,
+            "OK ?": "✅" if ok else "❌",
+        })
+    return results
+
+
 # ---------- Setup ----------
 st.set_page_config(
     page_title="Transfert IRM → NAS",
@@ -65,6 +92,7 @@ with st.sidebar:
             "② Extraction des animaux",
             "③ Transfert vers le NAS",
             "④ Logs & vérification",
+            "⌨️ Mode terminal",
             "ⓘ À propos",
         ],
         label_visibility="collapsed",
@@ -171,6 +199,29 @@ def page_extract():
         df = pd.DataFrame({"#": range(1, len(st.session_state.extracted_animals) + 1),
                            "Animal": st.session_state.extracted_animals})
         st.dataframe(df, hide_index=True, use_container_width=True)
+
+        # 🆕 Vérification PatientName — évite l'erreur "n'est pas le meme que le PatientID"
+        with st.expander("🔍 Vérifier la correspondance PatientName (recommandé)", expanded=True):
+            st.caption(
+                "On lit le PatientName du premier DICOM de chaque animal et on compare "
+                "au nom extrait. Si tout n'est pas ✅, ajustez `nb_separateurs` dans l'onglet ①."
+            )
+            if st.button("Lancer la vérification"):
+                try:
+                    src = Path(st.session_state.source_dir)
+                    rows = check_patient_names(src, st.session_state.extracted_animals)
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                    n_ko = sum(1 for r in rows if r["OK ?"] == "❌")
+                    if n_ko:
+                        st.error(
+                            f"{n_ko} animal(aux) ne correspondent pas au PatientName DICOM. "
+                            "Le transfert affichera des erreurs pour ceux-là. "
+                            "👉 Diminuez `nb_separateurs` dans l'onglet ① puis relancez l'extraction."
+                        )
+                    else:
+                        st.success("Toutes les correspondances sont OK 🎉")
+                except Exception as e:
+                    st.error(f"Erreur : {e}")
 
         # Edition libre + écriture sur disque + téléchargement
         edited = st.text_area(
@@ -333,6 +384,150 @@ def page_logs():
             st.caption("Dossier vide.")
 
 
+def page_cli():
+    st.header("⌨️ Mode terminal — simulation des scripts bash")
+    st.markdown(
+        "Cette vue reproduit fidèlement l'expérience en ligne de commande "
+        "telle que les chercheurs l'avaient avant cette interface : prompts identiques "
+        "aux scripts `animaux` et `copie_nas`, exécutés depuis la **Konsole**. "
+        "Pratique pour la formation, la transition, ou la démo audit."
+    )
+
+    script_choice = st.radio(
+        "Script à simuler",
+        ["animaux (extraction des animaux)", "copie_nas (transfert vers NAS)"],
+        horizontal=True,
+    )
+    is_script1 = script_choice.startswith("animaux")
+    cmd_name = "animaux" if is_script1 else "copie_nas"
+
+    state_key = f"cli_state_{cmd_name}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = {"step": 0, "answers": {}, "done": False, "result": None}
+    state = st.session_state[state_key]
+
+    # Définition des prompts (identiques aux scripts bash)
+    if is_script1:
+        steps = [
+            {"prompt": "Les données a copier sont-elles des données dicom ou bruker ?",
+             "field": "type", "default": "dicom", "hint": "dicom / bruker"},
+            {"prompt": "Dans quel sous dossier se trouve les noms des animaux a recuperer ? /opt/PV6.0.1/",
+             "field": "sous_dossier", "default": "DICOM-Laurent",
+             "hint": "ex. DICOM-Laurent"},
+            {"prompt": "Combien de '_' comprend le nom des animaux ?",
+             "field": "nb_sep", "default": "2", "hint": "ex. 2 pour F_2_4"},
+            {"prompt": "Quel nom souhaitez-vous pour le .txt comprenant le nom des animaux : /opt/code_nas/",
+             "field": "name", "default": "animaux_copitch", "hint": "sans .txt"},
+        ]
+    else:
+        steps = [
+            {"prompt": "Les données a copier sont-elles des données dicom ou bruker ?",
+             "field": "type", "default": "dicom", "hint": "dicom / bruker"},
+            {"prompt": "Dans quel sous dossier se trouve les sequences dicom à copier sur le NAS ? /opt/PV6.0.1/",
+             "field": "sous_dossier_dicom", "default": "DICOM-Laurent", "hint": ""},
+            {"prompt": "Dans quel dossier faut-il copier ces images ? /opt/NASIRM/",
+             "field": "sous_dossier_NAS", "default": "copitch", "hint": ""},
+            {"prompt": "fichier comprenant les animaux a traiter : /opt/code_nas/",
+             "field": "file_animaux", "default": "animaux_copitch.txt", "hint": ""},
+        ]
+
+    # Reconstruction de l'affichage type "Konsole"
+    PROMPT = "[MATISSE@CZC6177SYC ~]$"
+    lines = [f"{PROMPT} {cmd_name}"]
+    for i, s in enumerate(steps):
+        if i < state["step"]:
+            ans = state["answers"].get(s["field"], "")
+            lines.append(f"{s['prompt']} {ans}")
+        elif i == state["step"] and not state["done"]:
+            lines.append(s["prompt"])
+
+    if state["done"]:
+        # On termine par le retour du prompt et l'output éventuel
+        if state.get("result_lines"):
+            lines.extend(state["result_lines"])
+        lines.append(f"{PROMPT} ")
+
+    st.markdown(
+        f"""
+        <div style="background:#1e1e1e;color:#d4d4d4;font-family:monospace;
+                    padding:14px;border-radius:6px;font-size:13px;
+                    white-space:pre-wrap;line-height:1.5;border:1px solid #444;">
+{chr(10).join(lines)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+    if state["done"]:
+        st.success(f"✅ Script `{cmd_name}` terminé. Voir résultat ci-dessous.")
+        if state["result"] is not None:
+            if cmd_name == "animaux":
+                st.subheader("Contenu du fichier .txt généré")
+                st.code("\n".join(state["result"]) or "(vide)", language="text")
+            else:
+                stats = state["result"]
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Séquences", stats.sequences_total)
+                c2.metric("Fichiers copiés", stats.files_copied)
+                c3.metric("Errors / Warnings", f"{len(stats.errors)} / {len(stats.warnings)}")
+        if st.button("🔄 Recommencer", key=f"reset_{cmd_name}"):
+            st.session_state[state_key] = {"step": 0, "answers": {}, "done": False, "result": None}
+            st.rerun()
+        return
+
+    # Saisie en cours
+    current = steps[state["step"]]
+    with st.form(key=f"form_{cmd_name}_{state['step']}", clear_on_submit=True):
+        val = st.text_input(
+            f"Saisie ({current['hint']})" if current["hint"] else "Saisie",
+            value="",
+            placeholder=current["default"],
+        )
+        submitted = st.form_submit_button("⏎ Entrée")
+        if submitted:
+            val = val.strip() or current["default"]
+            state["answers"][current["field"]] = val
+            state["step"] += 1
+            if state["step"] >= len(steps):
+                # Exécution réelle — utilise les chemins config de l'onglet ①
+                try:
+                    if is_script1:
+                        src = Path(st.session_state.source_dir or str(DEMO_SOURCE))
+                        res = extract_animals(
+                            src,
+                            state["answers"]["type"],
+                            int(state["answers"]["nb_sep"]),
+                        )
+                        out_path = WORK_DIR / f"{state['answers']['name']}.txt"
+                        write_animals_file(res.animals, out_path)
+                        state["result"] = res.animals
+                        state["result_lines"] = [
+                            f"  → {len(res.animals)} animaux extraits dans {out_path}",
+                        ]
+                        # Met à jour la session pour le reste de l'app
+                        st.session_state.extracted_animals = res.animals
+                    else:
+                        src = Path(st.session_state.source_dir or str(DEMO_SOURCE))
+                        nas = Path(st.session_state.nas_dir or str(DEMO_NAS))
+                        animals = list(st.session_state.extracted_animals or [])
+                        if not animals:
+                            state["result_lines"] = ["  → liste d'animaux vide, passez d'abord par 'animaux'"]
+                            state["result"] = None
+                        else:
+                            stats = transfer_to_nas(src, nas, animals)
+                            state["result"] = stats
+                            state["result_lines"] = [
+                                f"  → {stats.files_copied} fichiers copiés, "
+                                f"{len(stats.errors)} erreurs, {len(stats.warnings)} warnings",
+                            ]
+                    state["done"] = True
+                except Exception as e:
+                    state["result_lines"] = [f"  → erreur: {e}"]
+                    state["done"] = True
+            st.rerun()
+
+
 def page_about():
     st.header("ⓘ À propos")
     st.markdown(
@@ -362,6 +557,7 @@ PAGES = {
     "② Extraction des animaux": page_extract,
     "③ Transfert vers le NAS": page_transfer,
     "④ Logs & vérification": page_logs,
+    "⌨️ Mode terminal": page_cli,
     "ⓘ À propos": page_about,
 }
 
