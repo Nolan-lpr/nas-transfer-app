@@ -95,7 +95,7 @@ nas_transfer_app/
 
 ---
 
-## ⚙️ Workflow utilisateur
+## ⚙️ Utilisation
 
 1. **Configuration** : type de données (DICOM/Bruker), dossier source,
    dossier cible NAS, nombre de séparateurs `_` dans les noms d'animaux.

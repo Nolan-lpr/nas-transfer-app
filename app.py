@@ -19,7 +19,7 @@ from core.dicom_transfer import transfer_to_nas
 # ---------- Setup ----------
 st.set_page_config(
     page_title="Transfert IRM → NAS",
-    page_icon="🧠",
+    page_icon="📡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -79,11 +79,11 @@ def check_patient_names(source_dir: Path, animals: list[str]) -> list[dict]:
 
 # ---------- Sidebar ----------
 with st.sidebar:
-    st.title("🧠 Transfert IRM → NAS")
+    st.title("Transfert IRM → NAS")
     st.caption("Interface unifiée des scripts `animaux` & `copie_nas`")
     page = st.radio(
         "Navigation",
-        ["📋 Workflow", "⌨️ Mode terminal", "ⓘ À propos"],
+        ["📋 Nouvelle interface", "⌨️ Ancienne interface", "ⓘ À propos"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -96,7 +96,7 @@ with st.sidebar:
 #  PAGE 1 — WORKFLOW UNIFIÉ
 # ============================================================
 def page_workflow():
-    st.title("🧠 Transfert IRM → NAS")
+    st.title("Transfert IRM → NAS")
     st.caption(
         "Toute la procédure sur une page : configurer → extraire les animaux → "
         "transférer vers le NAS → vérifier les logs."
@@ -327,7 +327,7 @@ def page_workflow():
 #  PAGE 2 — MODE TERMINAL (CLI)
 # ============================================================
 def page_cli():
-    st.header("⌨️ Mode terminal — simulation des scripts bash")
+    st.header("⌨️ Ancienne interface — simulation des scripts bash")
     st.markdown(
         "Reproduit fidèlement l'expérience en ligne de commande des scripts "
         "`animaux` et `copie_nas` tels qu'utilisés avant cette interface. "
@@ -478,8 +478,8 @@ def page_about():
           paramétrage `nb_separateurs`.
         - **Mode simulation** (dry-run) : on peut voir ce qui sera fait avant
           de copier.
-        - **Mode terminal** : reproduit fidèlement l'expérience bash pour la
-          transition / formation.
+        - **Ancienne interface** : reproduit fidèlement l'expérience bash
+          (Konsole) pour la transition et la formation.
         - **Logs en temps réel** et téléchargement direct des `.txt` et `.log`.
 
         ### Pour utiliser cette app sur les vraies données
@@ -495,8 +495,8 @@ def page_about():
 
 
 PAGES = {
-    "📋 Workflow": page_workflow,
-    "⌨️ Mode terminal": page_cli,
+    "📋 Nouvelle interface": page_workflow,
+    "⌨️ Ancienne interface": page_cli,
     "ⓘ À propos": page_about,
 }
 
