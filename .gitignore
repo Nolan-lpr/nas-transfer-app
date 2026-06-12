@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+workspace/
+sample_data/nas_target/*
+!sample_data/nas_target/.gitkeep
