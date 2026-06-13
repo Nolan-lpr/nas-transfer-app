@@ -1,31 +1,489 @@
-"""Interface graphique pour le workflow de transfert IRM → NAS.
+"""Transfert IRM → NAS — application Streamlit autonome (un seul fichier).
 
-Regroupe les deux scripts bash (`creation_fichier_animaux.sh` et
-`creation_folder_group_dicom.sh`) en une UI web unifiée.
+Cette application regroupe en une seule interface graphique les deux scripts
+bash utilisés au CHR pour transférer les données IRM vers le NAS :
+
+  - `creation_fichier_animaux.sh`  → extraction des noms d'animaux uniques
+  - `creation_folder_group_dicom.sh` → copie des séquences DICOM vers le NAS
+    dans l'arborescence `{NAS}/{StudyDate}_{sujet}/{Time}/IRM/dicom/{séquence}/`
+
+Tout le code Python est volontairement regroupé dans ce fichier pour
+faciliter la maintenance et la revue (un seul endroit à lire / patcher).
+
+╔════════════════════════════════════════════════════════════════════════╗
+║  SOMMAIRE                                                              ║
+╠════════════════════════════════════════════════════════════════════════╣
+║  1. IMPORTS                                                            ║
+║  2. CONFIGURATION STREAMLIT & CONSTANTES                               ║
+║  3. LECTURE DICOM         (remplace dcmftest/dcmdump du script bash)   ║
+║  4. EXTRACTION D'ANIMAUX  (équivalent script `animaux`)                ║
+║  5. TRANSFERT VERS LE NAS (équivalent script `copie_nas`)              ║
+║  6. UTILITAIRES UI        (ZIP, file manager, lecture multi-DICOM…)    ║
+║  7. ÉTAT DE SESSION & SIDEBAR                                          ║
+║  8. PAGES                 (Workflow, Ancienne interface, À propos)     ║
+║  9. ROUTAGE FINAL                                                      ║
+╚════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
+# ════════════════════════════════════════════════════════════════════════
+# 1. IMPORTS
+# ════════════════════════════════════════════════════════════════════════
+import filecmp
 import io
 import platform
+import shutil
 import subprocess
 import tempfile
 import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from typing import Callable, Iterable
 
 import pandas as pd
 import pydicom
 import streamlit as st
-
-from core.animal_extractor import extract_animals, write_animals_file
-from core.dicom_reader import first_dicom_in, read_meta
-from core.dicom_transfer import transfer_to_nas
+from pydicom.errors import InvalidDicomError
 
 
+# ════════════════════════════════════════════════════════════════════════
+# 2. CONFIGURATION STREAMLIT & CONSTANTES
+# ════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="Transfert IRM → NAS",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+APP_ROOT = Path(__file__).parent.resolve()
+DEMO_SOURCE = APP_ROOT / "sample_data" / "dicom_source"
+DEMO_NAS = APP_ROOT / "sample_data" / "nas_target"
+WORK_DIR = APP_ROOT / "workspace"
+WORK_DIR.mkdir(exist_ok=True)
+
+# Correspond au "first" du script bash : DICOM commence au champ 1, Bruker au 3
+FIRST_FIELD = {"dicom": 1, "bruker": 3}
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 3. LECTURE DICOM
+#    Remplace les binaires Linux `dcmftest` et `dcmdump` du script bash
+#    par pydicom → portable Linux / macOS / Windows et déployable cloud.
+# ════════════════════════════════════════════════════════════════════════
+@dataclass
+class DicomMeta:
+    """Champs DICOM utiles au workflow."""
+    patient_name: str
+    study_date: str
+    study_id: str
+    modality: str
+    protocol_name: str
+    is_valid: bool = True
+    error: str | None = None
+
+
+def _clean(value) -> str:
+    """Nettoie une valeur DICOM (None → '', espaces → '_')."""
+    if value is None:
+        return ""
+    return str(value).strip().replace(" ", "_")
+
+
+def is_dicom(path: Path) -> bool:
+    """Vrai si `path` est un fichier DICOM lisible. Équivalent `dcmftest`."""
+    try:
+        pydicom.dcmread(str(path), stop_before_pixels=True, force=False)
+        return True
+    except (InvalidDicomError, FileNotFoundError, IsADirectoryError, PermissionError):
+        return False
+    except Exception:
+        return False
+
+
+def read_meta(path: Path) -> DicomMeta:
+    """Lit les tags PatientName/StudyDate/StudyID/Modality/ProtocolName.
+
+    Équivalent de `dcmdump -M +P "0010,0010" +P "0008,0020" ...`.
+    """
+    try:
+        ds = pydicom.dcmread(str(path), stop_before_pixels=True, force=False)
+    except Exception as e:
+        return DicomMeta("", "", "", "", "", is_valid=False, error=str(e))
+    return DicomMeta(
+        patient_name=_clean(ds.get("PatientName", "")),
+        study_date=_clean(ds.get("StudyDate", "")),
+        study_id=_clean(ds.get("StudyID", "")),
+        modality=_clean(ds.get("Modality", "")),
+        protocol_name=_clean(ds.get("ProtocolName", "")),
+    )
+
+
+def first_dicom_in(folder: Path) -> Path | None:
+    """Premier fichier DICOM trouvé dans le dossier.
+
+    Équivalent `find -iname 'MR*' | head -n 1` mais plus tolérant
+    (cherche aussi *.dcm).
+    """
+    if not folder.is_dir():
+        return None
+    candidates = sorted(
+        list(folder.glob("MR*"))
+        + list(folder.glob("mr*"))
+        + list(folder.glob("*.dcm"))
+        + list(folder.glob("*.DCM"))
+    )
+    for c in candidates:
+        if c.is_file() and is_dicom(c):
+            return c
+    # Fallback : on essaie tout fichier du dossier
+    for c in sorted(folder.iterdir()):
+        if c.is_file() and is_dicom(c):
+            return c
+    return None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 4. EXTRACTION DES NOMS D'ANIMAUX
+#    Équivalent du script bash `creation_fichier_animaux.sh` :
+#    - DICOM  : on prend les `nb_separateur + 1` premiers segments séparés par '_'
+#    - Bruker : on saute les 2 premiers segments (préfixe paravision technique)
+#               puis on prend `nb_separateur + 1` segments
+#    - On déduplique en préservant l'ordre, et on écrit dans un .txt
+# ════════════════════════════════════════════════════════════════════════
+@dataclass
+class ExtractionResult:
+    animals: list[str]
+    inspected_folders: int
+    skipped_folders: list[str]
+
+
+def extract_animal_name(folder_name: str, source_type: str, nb_separateurs: int) -> str | None:
+    """Reproduit la logique bash :
+        nb_separateur_tot = nb_separateur + first
+        name = cut -d'_' -f${first}-${nb_separateur_tot}
+
+    Le `cut` bash est inclusif aux deux bornes → on garde
+    `(nb_separateur_tot - first + 1) = nb_separateur + 1` champs.
+    """
+    if source_type not in FIRST_FIELD:
+        raise ValueError(f"Type inconnu : {source_type}")
+
+    parts = folder_name.split("_")
+    separateurs = folder_name.count("_")
+    if separateurs < nb_separateurs:
+        return None
+
+    first = FIRST_FIELD[source_type]
+    last = nb_separateurs + first  # inclusif
+    # bash `cut -f1-N` indexe à partir de 1 → conversion en 0-based
+    selected = parts[first - 1:last]
+    if not selected:
+        return None
+    return "_".join(selected)
+
+
+def extract_animals(source_dir: Path, source_type: str, nb_separateurs: int) -> ExtractionResult:
+    """Parcourt les sous-dossiers et extrait la liste unique des animaux."""
+    source_dir = Path(source_dir)
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"Dossier source introuvable : {source_dir}")
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    skipped: list[str] = []
+    inspected = 0
+
+    for entry in sorted(source_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        inspected += 1
+        name = extract_animal_name(entry.name, source_type, nb_separateurs)
+        if name is None:
+            skipped.append(entry.name)
+            continue
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+
+    return ExtractionResult(animals=ordered, inspected_folders=inspected, skipped_folders=skipped)
+
+
+def write_animals_file(animals: list[str], output_path: Path) -> Path:
+    """Sérialise la liste dans un .txt (un animal par ligne)."""
+    output_path = Path(output_path)
+    if output_path.suffix != ".txt":
+        output_path = output_path.with_suffix(".txt")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(animals) + ("\n" if animals else ""))
+    return output_path
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 5. TRANSFERT VERS LE NAS
+#    Équivalent du script bash `creation_folder_group_dicom.sh`.
+#    Structure cible : {NAS}/{StudyDate}_{sujet}/{Time}/IRM/dicom/{séquence}/
+# ════════════════════════════════════════════════════════════════════════
+LogCallback = Callable[[str], None]
+
+
+@dataclass
+class TransferStats:
+    sequences_total: int = 0
+    sequences_copied: int = 0
+    files_copied: int = 0
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    new_animals: list[str] = field(default_factory=list)
+    new_timepoints: list[str] = field(default_factory=list)
+
+
+def _today() -> str:
+    return datetime.now().strftime("%y_%m_%d")
+
+
+def _emit(log: LogCallback | None, line: str, log_file: Path | None):
+    """Envoie une ligne au callback UI et l'append au .log sur disque."""
+    if log:
+        log(line)
+    if log_file:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            with log_file.open("a") as fh:
+                fh.write(line + "\n")
+        except Exception:
+            pass
+
+
+def _copy_dicoms(src_seq: Path, dst_seq: Path) -> int:
+    """Copie tous les DICOM valides de src vers dst. Retourne le nombre copié."""
+    dst_seq.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for f in sorted(src_seq.iterdir()):
+        if f.is_file() and is_dicom(f):
+            shutil.copy2(f, dst_seq / f.name)
+            n += 1
+    return n
+
+
+def _folders_differ(a: Path, b: Path) -> bool:
+    """Équivalent de `diff folder1/ folder2/`."""
+    cmp = filecmp.dircmp(str(a), str(b))
+    if cmp.left_only or cmp.right_only or cmp.diff_files or cmp.funny_files:
+        return True
+    return False
+
+
+def _next_dedup_index(parent: Path, base_name: str, max_index: int = 2) -> int:
+    """Prochaine valeur i telle que {base_name}_{i} n'existe pas (1..max_index)."""
+    i = 1
+    while (parent / f"{base_name}_{i}").exists() and i <= max_index:
+        i += 1
+    return i
+
+
+def _find_animal_parent(nas_dir: Path, subject: str) -> list[Path]:
+    """Cherche les dossiers du NAS dont le nom se termine par `subject`."""
+    return [p for p in nas_dir.iterdir() if p.is_dir() and p.name.endswith(subject)]
+
+
+def transfer_to_nas(
+    source_dicom_dir: Path,
+    nas_target_dir: Path,
+    animals: Iterable[str],
+    log_callback: LogCallback | None = None,
+) -> TransferStats:
+    """Boucle principale : pour chaque animal, repère ses séquences, lit les
+    métadonnées DICOM, crée l'arborescence cible et copie les images.
+
+    Gère les cas :
+      - nouvel animal              → créé
+      - animal connu, même date    → ajoute / ignore / dédoublonne séquences
+      - animal connu, autre date   → ajoute un nouveau "Time" (T0, T1, …)
+      - PatientName != sujet       → erreur loguée, séquence sautée
+      - plusieurs dossiers parents → erreur loguée
+    """
+    source_dicom_dir = Path(source_dicom_dir)
+    nas_target_dir = Path(nas_target_dir)
+    nas_target_dir.mkdir(parents=True, exist_ok=True)
+
+    log_file = nas_target_dir / f"{nas_target_dir.name}.log"
+    date = _today()
+    stats = TransferStats()
+
+    for subject in animals:
+        subject = subject.strip()
+        if not subject:
+            continue
+
+        # Toutes les séquences du sujet
+        seq_dirs = sorted(
+            p for p in source_dicom_dir.iterdir()
+            if p.is_dir() and p.name.lower().startswith(subject.lower() + "_")
+        )
+        if not seq_dirs:
+            msg = f"[ERROR] l'animal {subject} n'existe pas"
+            stats.errors.append(msg)
+            _emit(log_callback, f"{date} {msg}", log_file)
+            continue
+
+        temp_new_timepoint_logged = False
+        name_mismatch_logged = False
+
+        for seq in seq_dirs:
+            stats.sequences_total += 1
+
+            dcm = first_dicom_in(seq)
+            if dcm is None:
+                msg = f"[ERROR] [DICOM] probleme dans le dossier sequence {seq.name}"
+                stats.errors.append(msg)
+                _emit(log_callback, f"{date} {msg}", log_file)
+                continue
+
+            meta = read_meta(dcm)
+            if not meta.is_valid:
+                msg = f"[ERROR] [DICOM] lecture impossible {seq.name}: {meta.error}"
+                stats.errors.append(msg)
+                _emit(log_callback, f"{date} {msg}", log_file)
+                continue
+
+            # Vérification nom animal vs PatientName DICOM
+            if meta.patient_name != subject:
+                if not name_mismatch_logged:
+                    msg = (f"[ERROR] Le nom de l'animal {subject} n'est pas le meme "
+                           f"que le PatientID: {meta.patient_name}")
+                    stats.errors.append(msg)
+                    _emit(log_callback, f"{date} {msg}", log_file)
+                    name_mismatch_logged = True
+                continue
+
+            # Time : T0 si PatientName == StudyID, sinon dernier segment de StudyID
+            if meta.patient_name == meta.study_id:
+                time = "T0"
+            else:
+                time = meta.study_id.split("_")[-1] if meta.study_id else "T0"
+
+            # Modalité
+            if meta.modality == "MR":
+                name_modalite = "IRM"
+            else:
+                msg = f"[WARNING] modalite n'est pas IRM pour {seq.name} ({meta.modality})"
+                stats.warnings.append(msg)
+                _emit(log_callback, f"{date} {msg}", log_file)
+                name_modalite = meta.modality or "INCONNU"
+
+            # Nom de séquence (le script bash gère aussi _P{n} pour Bruker —
+            # ici simplifié à `ProtocolName`)
+            name_sequence = meta.protocol_name or "sequence"
+
+            # Chemin de destination
+            study_dir = nas_target_dir / f"{meta.study_date}_{subject}"
+            time_dir = study_dir / time / name_modalite / "dicom"
+            seq_dst = time_dir / name_sequence
+
+            parents = _find_animal_parent(nas_target_dir, subject)
+
+            # ---- Cas 1 : nouvel animal ----
+            if not parents:
+                seq_dst.mkdir(parents=True, exist_ok=True)
+                n = _copy_dicoms(seq, seq_dst)
+                stats.files_copied += n
+                stats.sequences_copied += 1
+                if subject not in stats.new_animals:
+                    stats.new_animals.append(subject)
+                    _emit(log_callback,
+                          f"{date} creation d'un nouvel animal {subject}", log_file)
+                if _folders_differ(seq, seq_dst):
+                    msg = f"[ERROR] [DICOM] mauvaise copie de la sequence {name_sequence}"
+                    stats.errors.append(msg)
+                    _emit(log_callback, f"{date} {msg}", log_file)
+                continue
+
+            # ---- Cas dégénéré : plusieurs dossiers parents ----
+            if len(parents) > 1:
+                msg = (f"[ERROR] Il existe plusieurs dossiers parents: {len(parents)} "
+                       f"pour l'animal {subject}")
+                stats.errors.append(msg)
+                _emit(log_callback, f"{date} {msg}", log_file)
+                continue
+
+            existing_parent = parents[0]
+            expected_parent = nas_target_dir / f"{meta.study_date}_{subject}"
+
+            # ---- Cas 2 : animal connu, même date d'étude ----
+            if existing_parent.resolve() == expected_parent.resolve():
+                if seq_dst.is_dir() and any(seq_dst.iterdir()):
+                    # Le dossier de séquence existe déjà
+                    if not _folders_differ(seq, seq_dst):
+                        # Contenu identique → déjà copié
+                        msg = f"[WARNING] [DICOM] folder {seq_dst} exist"
+                        stats.warnings.append(msg)
+                        _emit(log_callback, f"{date} {msg}", log_file)
+                    else:
+                        # Contenu différent → on dédoublonne avec un suffixe _N
+                        msg = (f"[WARNING] [DICOM] plusieurs sequences ont le meme nom "
+                               f"{name_sequence} pour {subject}")
+                        stats.warnings.append(msg)
+                        _emit(log_callback, f"{date} {msg}", log_file)
+                        idx = _next_dedup_index(time_dir, name_sequence, max_index=2)
+                        if idx <= 2:
+                            dedup_dst = time_dir / f"{name_sequence}_{idx}"
+                            n = _copy_dicoms(seq, dedup_dst)
+                            stats.files_copied += n
+                            stats.sequences_copied += 1
+                else:
+                    # Première copie de cette séquence pour cet animal/cette date
+                    seq_dst.mkdir(parents=True, exist_ok=True)
+                    n = _copy_dicoms(seq, seq_dst)
+                    stats.files_copied += n
+                    stats.sequences_copied += 1
+                    if _folders_differ(seq, seq_dst):
+                        msg = f"[ERROR] [DICOM] mauvaise copie de la sequence {name_sequence}"
+                        stats.errors.append(msg)
+                        _emit(log_callback, f"{date} {msg}", log_file)
+            # ---- Cas 3 : animal connu mais autre date → nouveau "Time" ----
+            else:
+                newtime = existing_parent / time / name_modalite / "dicom"
+                if not temp_new_timepoint_logged:
+                    stats.new_timepoints.append(f"{subject} @ {time}")
+                    _emit(
+                        log_callback,
+                        f"{date} ajout d'un nouveau temps d'acquisition {time} "
+                        f"pour un animal {subject} existant sur le NAS",
+                        log_file,
+                    )
+                    temp_new_timepoint_logged = True
+                newtime.mkdir(parents=True, exist_ok=True)
+                final_dst = newtime / name_sequence
+                if final_dst.is_dir() and any(final_dst.iterdir()):
+                    if not _folders_differ(seq, final_dst):
+                        msg = f"[WARNING] [DICOM] folder {final_dst} exist"
+                        stats.warnings.append(msg)
+                        _emit(log_callback, f"{date} {msg}", log_file)
+                    else:
+                        idx = _next_dedup_index(newtime, name_sequence, max_index=2)
+                        if idx <= 2:
+                            dedup_dst = newtime / f"{name_sequence}_{idx}"
+                            n = _copy_dicoms(seq, dedup_dst)
+                            stats.files_copied += n
+                            stats.sequences_copied += 1
+                else:
+                    n = _copy_dicoms(seq, final_dst)
+                    stats.files_copied += n
+                    stats.sequences_copied += 1
+
+    return stats
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 6. UTILITAIRES UI
+# ════════════════════════════════════════════════════════════════════════
 def _extract_zip_to_temp(uploaded_file) -> Path:
-    """Décompresse un ZIP uploadé dans un dossier temporaire et renvoie son chemin.
+    """Décompresse un ZIP uploadé dans un dossier temporaire.
 
-    Si le ZIP contient un unique dossier racine, on retourne ce dossier
+    Si le ZIP contient un unique dossier racine, retourne ce dossier
     directement (UX plus naturelle).
     """
     tmp = Path(tempfile.mkdtemp(prefix="dicom_src_"))
@@ -38,10 +496,10 @@ def _extract_zip_to_temp(uploaded_file) -> Path:
 
 
 def open_in_file_manager(path: Path) -> tuple[bool, str]:
-    """Ouvre le chemin dans l'explorateur natif de l'OS.
+    """Ouvre `path` dans Finder / Nautilus / Explorer selon l'OS.
 
-    Ne fonctionne que si l'app tourne en local (le serveur cloud n'a pas de
-    desktop). Retourne (succès, message).
+    Ne fonctionne qu'en local — le serveur Streamlit Cloud n'a pas de desktop.
+    Retourne (succès, message).
     """
     try:
         system = platform.system()
@@ -72,7 +530,7 @@ def zip_directory_to_bytes(path: Path) -> bytes:
 
 
 def _animal_names_from_dicom_files(files) -> tuple[list[str], int, int]:
-    """Lit chaque fichier uploadé et extrait PatientName.
+    """Lit chaque fichier uploadé et extrait son tag PatientName.
 
     Retourne (animaux_uniques, nb_lus, nb_erreurs).
     """
@@ -93,21 +551,38 @@ def _animal_names_from_dicom_files(files) -> tuple[list[str], int, int]:
     return ordered, len(files), n_err
 
 
-# ---------- Setup ----------
-st.set_page_config(
-    page_title="Transfert IRM → NAS",
-    page_icon="📡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+def check_patient_names(source_dir: Path, animals: list[str]) -> list[dict]:
+    """Pour chaque animal, lit le PatientName du premier DICOM trouvé
+    et compare. Sert à valider le réglage `nb_separateurs`."""
+    results = []
+    for a in animals:
+        match = next(
+            (p for p in source_dir.iterdir()
+             if p.is_dir() and p.name.lower().startswith(a.lower() + "_")),
+            None,
+        )
+        if match is None:
+            results.append({"Animal": a, "Dossier": "(introuvable)",
+                            "PatientName": "—", "Match": "❌"})
+            continue
+        dcm = first_dicom_in(match)
+        if dcm is None:
+            results.append({"Animal": a, "Dossier": match.name,
+                            "PatientName": "(pas de DICOM)", "Match": "❌"})
+            continue
+        meta = read_meta(dcm)
+        results.append({
+            "Animal": a,
+            "Dossier": match.name,
+            "PatientName": meta.patient_name,
+            "Match": "✅" if meta.patient_name == a else "❌",
+        })
+    return results
 
-APP_ROOT = Path(__file__).parent.resolve()
-DEMO_SOURCE = APP_ROOT / "sample_data" / "dicom_source"
-DEMO_NAS = APP_ROOT / "sample_data" / "nas_target"
-WORK_DIR = APP_ROOT / "workspace"
-WORK_DIR.mkdir(exist_ok=True)
 
-
+# ════════════════════════════════════════════════════════════════════════
+# 7. ÉTAT DE SESSION & SIDEBAR
+# ════════════════════════════════════════════════════════════════════════
 def _init_state():
     defaults = {
         "source_type": "dicom",
@@ -126,35 +601,6 @@ def _init_state():
 
 _init_state()
 
-
-def check_patient_names(source_dir: Path, animals: list[str]) -> list[dict]:
-    """Pour chaque animal, lit le PatientName du premier DICOM trouvé et compare."""
-    results = []
-    for a in animals:
-        match = next(
-            (p for p in source_dir.iterdir()
-             if p.is_dir() and p.name.lower().startswith(a.lower() + "_")),
-            None,
-        )
-        if match is None:
-            results.append({"Animal": a, "Dossier": "(introuvable)", "PatientName": "—", "Match": "❌"})
-            continue
-        dcm = first_dicom_in(match)
-        if dcm is None:
-            results.append({"Animal": a, "Dossier": match.name, "PatientName": "(pas de DICOM)", "Match": "❌"})
-            continue
-        meta = read_meta(dcm)
-        ok = meta.patient_name == a
-        results.append({
-            "Animal": a,
-            "Dossier": match.name,
-            "PatientName": meta.patient_name,
-            "Match": "✅" if ok else "❌",
-        })
-    return results
-
-
-# ---------- Sidebar ----------
 with st.sidebar:
     st.title("Transfert IRM → NAS")
     st.caption("Interface unifiée des scripts `animaux` & `copie_nas`")
@@ -169,9 +615,11 @@ with st.sidebar:
     st.caption("CHR · MVP audit")
 
 
-# ============================================================
-#  PAGE 1 — WORKFLOW UNIFIÉ
-# ============================================================
+# ════════════════════════════════════════════════════════════════════════
+# 8. PAGES
+# ════════════════════════════════════════════════════════════════════════
+
+# ---------- PAGE : Nouvelle interface (workflow unifié) ----------
 def page_workflow():
     st.title("Transfert IRM → NAS")
     st.caption(
@@ -273,7 +721,7 @@ def page_workflow():
     # ----- 2. LISTE DES ANIMAUX -----
     st.subheader("2 · Liste des animaux à traiter")
     st.caption(
-        "Trois façons d'alimenter la liste — équivalent au script `animaux` "
+        "Quatre façons d'alimenter la liste — équivalent au script `animaux` "
         "ou à n'importe quel `.txt` existant utilisé par `copie_nas`."
     )
 
@@ -356,7 +804,6 @@ def page_workflow():
                     f"Le transfert affichera des erreurs pour ces animaux."
                 )
 
-    # Édition / export — pratiques si on vient d'extraire
     with st.expander("✏️ Éditer ou télécharger la liste"):
         edited = st.text_area(
             "Un animal par ligne",
@@ -418,7 +865,8 @@ def page_workflow():
                         dcm = first_dicom_in(s)
                         if dcm:
                             m = read_meta(dcm)
-                            cb(f"    └ {s.name} | StudyDate={m.study_date} Protocol={m.protocol_name}")
+                            cb(f"    └ {s.name} | StudyDate={m.study_date} "
+                               f"Protocol={m.protocol_name}")
                 st.success("Simulation terminée — aucun fichier écrit.")
             else:
                 stats = transfer_to_nas(src, nas, animals, log_callback=cb)
@@ -447,7 +895,6 @@ def page_workflow():
     # ----- 4. LOGS & ARBORESCENCE -----
     st.subheader("4 · Vérification du résultat")
     if nas.exists():
-        # Boutons d'accès rapide au dossier cible
         bc1, bc2, bc3 = st.columns([1, 1, 2])
         with bc1:
             if st.button("📂 Ouvrir l'explorateur", use_container_width=True,
@@ -510,9 +957,7 @@ def page_workflow():
         st.info("Le dossier NAS n'existe pas encore.")
 
 
-# ============================================================
-#  PAGE 2 — MODE TERMINAL (CLI)
-# ============================================================
+# ---------- PAGE : Ancienne interface (simulation Konsole) ----------
 def page_cli():
     st.header("⌨️ Ancienne interface — simulation des scripts bash")
     st.markdown(
@@ -647,9 +1092,7 @@ def page_cli():
             st.rerun()
 
 
-# ============================================================
-#  PAGE 3 — À PROPOS
-# ============================================================
+# ---------- PAGE : À propos ----------
 def page_about():
     st.header("ⓘ À propos")
     st.markdown(
@@ -673,6 +1116,11 @@ def page_about():
         Lancer l'app **en local** sur le PC d'acquisition IRM. Le déploiement
         cloud sert uniquement de **démonstration** avec les données embarquées.
 
+        ### Architecture du code
+        Tout le code Python tient dans **un seul fichier `app.py`** organisé
+        en 9 sections numérotées (voir le sommaire en tête du fichier).
+        Cette monolite volontaire simplifie la revue et la maintenance.
+
         ### Limites connues
         - Cas Bruker `_P{n}` (numéro paravision) simplifié à `ProtocolName`.
         - Pas d'authentification : protéger derrière un mot de passe Streamlit
@@ -681,6 +1129,9 @@ def page_about():
     )
 
 
+# ════════════════════════════════════════════════════════════════════════
+# 9. ROUTAGE FINAL
+# ════════════════════════════════════════════════════════════════════════
 PAGES = {
     "⌨️ Ancienne interface": page_cli,
     "📋 Nouvelle interface": page_workflow,
