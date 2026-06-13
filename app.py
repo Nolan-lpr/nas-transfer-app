@@ -161,13 +161,24 @@ def page_workflow():
 
     st.divider()
 
-    # ----- 2. EXTRACTION DES ANIMAUX -----
+    # ----- 2. LISTE DES ANIMAUX -----
     st.subheader("2 · Liste des animaux à traiter")
-    st.caption("Identifie les animaux uniques d'après le préfixe des sous-dossiers.")
+    st.caption(
+        "Trois façons d'alimenter la liste — équivalent au script `animaux` "
+        "ou à n'importe quel `.txt` existant utilisé par `copie_nas`."
+    )
 
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        if st.button("🔍 Extraire les animaux", type="primary", use_container_width=True):
+    method = st.radio(
+        "Méthode",
+        ["🔍 Extraire depuis le dossier source",
+         "📤 Importer un fichier .txt",
+         "✏️ Saisir manuellement"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if method.startswith("🔍"):
+        if st.button("Extraire les animaux", type="primary"):
             try:
                 res = extract_animals(src, st.session_state.source_type,
                                       int(st.session_state.nb_separateurs))
@@ -176,54 +187,71 @@ def page_workflow():
                     st.toast(f"{len(res.skipped_folders)} dossiers ignorés", icon="⚠️")
             except Exception as e:
                 st.error(f"Erreur : {e}")
+    elif method.startswith("📤"):
+        up = st.file_uploader("Fichier `.txt` (un animal par ligne)", type=["txt"])
+        if up is not None:
+            loaded = [l.strip() for l in up.read().decode().splitlines() if l.strip()]
+            st.session_state.extracted_animals = loaded
+            st.success(f"{len(loaded)} animaux chargés")
+    else:
+        txt = st.text_area(
+            "Un nom d'animal par ligne",
+            value="\n".join(st.session_state.extracted_animals),
+            height=160,
+        )
+        st.session_state.extracted_animals = [
+            l.strip() for l in txt.splitlines() if l.strip()
+        ]
 
     animals = st.session_state.extracted_animals
 
-    if animals:
-        with c2:
-            st.metric("Animaux détectés", len(animals))
+    if not animals:
+        st.info("Choisissez une méthode ci-dessus pour constituer la liste.")
+        st.stop()
 
-        # Vérification PatientName intégrée
+    st.metric("Animaux dans la liste", len(animals))
+
+    # Vérification PatientName — disponible quelle que soit la source
+    if src and src.is_dir():
         rows = check_patient_names(src, animals)
         n_ko = sum(1 for r in rows if r["Match"] == "❌")
-        df = pd.DataFrame(rows)
-        st.dataframe(df, hide_index=True, use_container_width=True)
-
-        if n_ko:
-            st.error(
-                f"❌ **{n_ko} animal(aux) ne correspondent pas au PatientName DICOM.** "
-                f"Vérifiez le réglage `Séparateurs _` ci-dessus (souvent `2` pour `M_4_11`)."
-            )
-        else:
-            st.success("Toutes les correspondances PatientName sont valides ✓")
-
-        # Édition / export
-        with st.expander("✏️ Éditer ou télécharger la liste"):
-            edited = st.text_area(
-                "Un animal par ligne",
-                value="\n".join(animals),
-                height=160,
-                label_visibility="collapsed",
-            )
-            animals = [l.strip() for l in edited.splitlines() if l.strip()]
-            st.session_state.extracted_animals = animals
-            ec1, ec2 = st.columns(2)
-            with ec1:
-                if st.button("💾 Sauvegarder en .txt"):
-                    out = WORK_DIR / f"{st.session_state.animals_file_name}.txt"
-                    write_animals_file(animals, out)
-                    st.success(f"Enregistré : `{out}`")
-            with ec2:
-                st.download_button(
-                    "⬇️ Télécharger .txt",
-                    data="\n".join(animals) + "\n",
-                    file_name=f"{st.session_state.animals_file_name}.txt",
-                    mime="text/plain",
-                    use_container_width=True,
+        with st.expander(
+            f"🔍 Vérification PatientName ({len(animals) - n_ko}/{len(animals)} OK)",
+            expanded=n_ko > 0,
+        ):
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            if n_ko:
+                st.warning(
+                    f"⚠️ **{n_ko} animal(aux) ne correspondent pas au PatientName DICOM.** "
+                    f"Soit le `.txt` ne correspond pas au dossier source, "
+                    f"soit `Séparateurs _` est mal réglé (souvent `2` pour `M_4_11`). "
+                    f"Le transfert affichera des erreurs pour ces animaux."
                 )
-    else:
-        st.info("Cliquez sur **Extraire les animaux** pour démarrer.")
-        st.stop()
+
+    # Édition / export — pratiques si on vient d'extraire
+    with st.expander("✏️ Éditer ou télécharger la liste"):
+        edited = st.text_area(
+            "Un animal par ligne",
+            value="\n".join(animals),
+            height=160,
+            key="edit_animals_textarea",
+        )
+        animals = [l.strip() for l in edited.splitlines() if l.strip()]
+        st.session_state.extracted_animals = animals
+        ec1, ec2 = st.columns(2)
+        with ec1:
+            if st.button("💾 Sauvegarder en .txt"):
+                out = WORK_DIR / f"{st.session_state.animals_file_name}.txt"
+                write_animals_file(animals, out)
+                st.success(f"Enregistré : `{out}`")
+        with ec2:
+            st.download_button(
+                "⬇️ Télécharger .txt",
+                data="\n".join(animals) + "\n",
+                file_name=f"{st.session_state.animals_file_name}.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
     st.divider()
 
