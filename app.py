@@ -6,6 +6,9 @@ Regroupe les deux scripts bash (`creation_fichier_animaux.sh` et
 
 from __future__ import annotations
 
+import io
+import platform
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -32,6 +35,40 @@ def _extract_zip_to_temp(uploaded_file) -> Path:
     if len(entries) == 1 and entries[0].is_dir():
         return entries[0]
     return tmp
+
+
+def open_in_file_manager(path: Path) -> tuple[bool, str]:
+    """Ouvre le chemin dans l'explorateur natif de l'OS.
+
+    Ne fonctionne que si l'app tourne en local (le serveur cloud n'a pas de
+    desktop). Retourne (succès, message).
+    """
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            subprocess.Popen(["open", str(path)])
+        elif system == "Linux":
+            subprocess.Popen(["xdg-open", str(path)])
+        elif system == "Windows":
+            subprocess.Popen(["explorer", str(path)])
+        else:
+            return False, f"OS non supporté : {system}"
+        return True, f"Ouvert dans l'explorateur ({system})"
+    except FileNotFoundError as e:
+        return False, f"Outil système indisponible (mode cloud ?) — {e}"
+    except Exception as e:
+        return False, str(e)
+
+
+def zip_directory_to_bytes(path: Path) -> bytes:
+    """Crée un ZIP en mémoire contenant toute l'arborescence de `path`."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in path.rglob("*"):
+            if f.is_file():
+                zf.write(f, arcname=str(f.relative_to(path)))
+    buf.seek(0)
+    return buf.read()
 
 
 def _animal_names_from_dicom_files(files) -> tuple[list[str], int, int]:
@@ -410,6 +447,37 @@ def page_workflow():
     # ----- 4. LOGS & ARBORESCENCE -----
     st.subheader("4 · Vérification du résultat")
     if nas.exists():
+        # Boutons d'accès rapide au dossier cible
+        bc1, bc2, bc3 = st.columns([1, 1, 2])
+        with bc1:
+            if st.button("📂 Ouvrir l'explorateur", use_container_width=True,
+                         help="Ouvre Finder / Nautilus / Explorer sur le dossier NAS. "
+                              "Ne fonctionne que si l'app tourne en local."):
+                ok, msg = open_in_file_manager(nas)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.warning(
+                        f"{msg}\n\nVous êtes probablement en mode cloud — "
+                        f"utilisez le téléchargement ZIP à droite pour récupérer "
+                        f"l'arborescence."
+                    )
+        with bc2:
+            try:
+                zip_bytes = zip_directory_to_bytes(nas)
+                st.download_button(
+                    "⬇️ Télécharger en ZIP",
+                    data=zip_bytes,
+                    file_name=f"{nas.name}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    help="Télécharge toute l'arborescence créée sur votre ordinateur",
+                )
+            except Exception as e:
+                st.caption(f"ZIP indisponible : {e}")
+        with bc3:
+            st.caption(f"📍 Chemin du dossier NAS : `{nas}`")
+
         log_file = nas / f"{nas.name}.log"
         lc1, lc2 = st.columns(2)
         with lc1:
