@@ -6,14 +6,54 @@ Regroupe les deux scripts bash (`creation_fichier_animaux.sh` et
 
 from __future__ import annotations
 
+import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
+import pydicom
 import streamlit as st
 
 from core.animal_extractor import extract_animals, write_animals_file
 from core.dicom_reader import first_dicom_in, read_meta
 from core.dicom_transfer import transfer_to_nas
+
+
+def _extract_zip_to_temp(uploaded_file) -> Path:
+    """Décompresse un ZIP uploadé dans un dossier temporaire et renvoie son chemin.
+
+    Si le ZIP contient un unique dossier racine, on retourne ce dossier
+    directement (UX plus naturelle).
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="dicom_src_"))
+    with zipfile.ZipFile(uploaded_file) as z:
+        z.extractall(tmp)
+    entries = [e for e in tmp.iterdir() if not e.name.startswith(".")]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return tmp
+
+
+def _animal_names_from_dicom_files(files) -> tuple[list[str], int, int]:
+    """Lit chaque fichier uploadé et extrait PatientName.
+
+    Retourne (animaux_uniques, nb_lus, nb_erreurs).
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    n_err = 0
+    for f in files:
+        try:
+            ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+            pn = str(ds.get("PatientName", "")).strip().replace(" ", "_")
+            if pn and pn not in seen:
+                seen.add(pn)
+                ordered.append(pn)
+            elif not pn:
+                n_err += 1
+        except Exception:
+            n_err += 1
+    return ordered, len(files), n_err
 
 
 # ---------- Setup ----------
@@ -126,11 +166,43 @@ def page_workflow():
             help="Sans extension `.txt`",
         )
 
-    st.session_state.source_dir = st.text_input(
-        "📁 Dossier source des séquences",
-        value=st.session_state.source_dir,
-        help="Ex. `/opt/PV6.0.1/DICOM-Laurent`",
-    )
+    # --- Dossier source : champ texte + boutons démo / upload ZIP ---
+    sc1, sc2, sc3 = st.columns([4, 1, 1.4])
+    with sc1:
+        st.session_state.source_dir = st.text_input(
+            "📁 Dossier source des séquences",
+            value=st.session_state.source_dir,
+            help=(
+                "En **local** : tapez n'importe quel chemin (ex. `/opt/PV6.0.1/DICOM-Laurent`).\n\n"
+                "En **cloud** : utilisez 🧪 Démo ou 📂 Importer un ZIP — le serveur "
+                "ne peut pas voir votre disque."
+            ),
+        )
+    with sc2:
+        st.write("")
+        st.write("")
+        if st.button("🧪 Démo", use_container_width=True,
+                     help="Restaurer le dossier d'exemple embarqué"):
+            st.session_state.source_dir = str(DEMO_SOURCE)
+            st.rerun()
+    with sc3:
+        st.write("")
+        st.write("")
+        with st.popover("📂 Importer ZIP", use_container_width=True):
+            st.caption(
+                "Zippez votre dossier DICOM sur votre PC, puis uploadez-le ici. "
+                "L'app décompresse côté serveur et utilise le résultat comme source."
+            )
+            zf = st.file_uploader("Fichier .zip", type=["zip"], key="src_zip_uploader")
+            if zf is not None:
+                try:
+                    p = _extract_zip_to_temp(zf)
+                    st.session_state.source_dir = str(p)
+                    st.success(f"Importé dans `{p}`")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erreur : {e}")
+
     st.session_state.nas_dir = st.text_input(
         "💾 Dossier cible sur le NAS",
         value=st.session_state.nas_dir,
@@ -171,6 +243,7 @@ def page_workflow():
     method = st.radio(
         "Méthode",
         ["🔍 Extraire depuis le dossier source",
+         "📂 Sélectionner des DICOM depuis l'ordinateur",
          "📤 Importer un fichier .txt",
          "✏️ Saisir manuellement"],
         horizontal=True,
@@ -187,6 +260,24 @@ def page_workflow():
                     st.toast(f"{len(res.skipped_folders)} dossiers ignorés", icon="⚠️")
             except Exception as e:
                 st.error(f"Erreur : {e}")
+    elif method.startswith("📂"):
+        st.caption(
+            "Sélectionnez plusieurs fichiers DICOM depuis votre ordinateur. "
+            "Le nom de chaque animal sera lu directement depuis le tag DICOM "
+            "`PatientName` — méthode la plus fiable, indépendante du nom des dossiers."
+        )
+        files = st.file_uploader(
+            "Fichiers DICOM (multi-sélection avec Cmd/Ctrl)",
+            type=["dcm", "DCM"],
+            accept_multiple_files=True,
+            key="dicom_files_uploader",
+        )
+        if files:
+            animals_list, n_read, n_err = _animal_names_from_dicom_files(files)
+            st.session_state.extracted_animals = animals_list
+            if n_err:
+                st.warning(f"{n_err} fichier(s) ignoré(s) (non-DICOM ou PatientName vide)")
+            st.success(f"{len(animals_list)} animaux uniques lus depuis {n_read} fichiers")
     elif method.startswith("📤"):
         up = st.file_uploader("Fichier `.txt` (un animal par ligne)", type=["txt"])
         if up is not None:
