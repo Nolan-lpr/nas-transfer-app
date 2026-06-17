@@ -908,17 +908,17 @@ def page_workflow():
                 m4.metric("Err / Warn", f"{len(stats.errors)} / {len(stats.warnings)}")
 
                 if stats.errors:
-                    st.error(
-                        f"{len(stats.errors)} erreur(s) — voir détails dans le .log "
-                        f"téléchargeable section 4."
-                    )
+                    with st.expander(f"❌ {len(stats.errors)} erreur(s)", expanded=True):
+                        for line in stats.errors:
+                            st.markdown(f"- `{line}`")
                 if stats.warnings:
-                    st.warning(
-                        f"{len(stats.warnings)} warning(s) — voir détails dans le .log "
-                        f"téléchargeable section 4."
-                    )
+                    with st.expander(f"⚠️ {len(stats.warnings)} warning(s)", expanded=True):
+                        for line in stats.warnings:
+                            st.markdown(f"- `{line}`")
                 if not stats.errors and not stats.warnings:
                     st.success("Transfert terminé sans erreur ni warning.")
+                else:
+                    st.caption("Log complet téléchargeable dans la section 4.")
         except Exception as e:
             st.error(f"Erreur lors du transfert : {e}")
 
