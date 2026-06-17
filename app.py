@@ -551,6 +551,21 @@ def _animal_names_from_dicom_files(files) -> tuple[list[str], int, int]:
     return ordered, len(files), n_err
 
 
+def detect_nb_separateurs(source_dir: Path) -> int | None:
+    """Lit le premier DICOM du dossier source et compte les `_` dans son
+    PatientName. C'est la valeur correcte pour `nb_separateurs`."""
+    if not source_dir.is_dir():
+        return None
+    for entry in sorted(source_dir.iterdir()):
+        if entry.is_dir():
+            dcm = first_dicom_in(entry)
+            if dcm is not None:
+                meta = read_meta(dcm)
+                if meta.is_valid and meta.patient_name:
+                    return meta.patient_name.count("_")
+    return None
+
+
 def check_patient_names(source_dir: Path, animals: list[str]) -> list[dict]:
     """Pour chaque animal, lit le PatientName du premier DICOM trouvé
     et compare. Sert à valider le réglage `nb_separateurs`."""
@@ -800,12 +815,26 @@ def page_workflow():
         ):
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
             if n_ko:
-                st.warning(
-                    f"⚠️ **{n_ko} animal(aux) ne correspondent pas au PatientName DICOM.** "
-                    f"Soit le `.txt` ne correspond pas au dossier source, "
-                    f"soit `Séparateurs _` est mal réglé (souvent `2` pour `M_4_11`). "
-                    f"Le transfert affichera des erreurs pour ces animaux."
-                )
+                wcol1, wcol2 = st.columns([3, 1])
+                with wcol1:
+                    st.warning(
+                        f"⚠️ **{n_ko} animal(aux) ne correspondent pas au PatientName DICOM.** "
+                        f"`Séparateurs _` est probablement mal réglé. "
+                        f"Cliquez sur 🎯 pour le corriger automatiquement."
+                    )
+                with wcol2:
+                    if st.button("🎯 Auto-corriger", use_container_width=True,
+                                 help="Détecte la bonne valeur de `nb_separateurs` "
+                                      "en lisant le PatientName d'un DICOM"):
+                        detected = detect_nb_separateurs(src)
+                        if detected is None:
+                            st.error("Impossible de lire un DICOM dans le dossier source.")
+                        else:
+                            st.session_state.nb_separateurs = detected
+                            st.session_state.extracted_animals = []
+                            st.toast(f"`nb_separateurs` corrigé à {detected}. "
+                                     f"Relancez l'extraction.", icon="✅")
+                            st.rerun()
 
     with st.expander("✏️ Éditer ou télécharger la liste"):
         edited = st.text_area(
