@@ -667,8 +667,11 @@ def page_workflow():
         st.write("")
         st.write("")
         if st.button("🧪 Démo", use_container_width=True,
-                     help="Restaurer le dossier d'exemple embarqué"):
+                     help="Restaurer le dossier d'exemple embarqué + la config qui va avec"):
             st.session_state.source_dir = str(DEMO_SOURCE)
+            st.session_state.nas_dir = str(DEMO_NAS)
+            st.session_state.source_type = "dicom"
+            st.session_state.nb_separateurs = 2
             st.rerun()
     with sc3:
         st.write("")
@@ -847,12 +850,12 @@ def page_workflow():
 
     if run_btn:
         progress = st.progress(0.0, text="Préparation…")
-        log_area = st.empty()
         lines: list[str] = []
 
         def cb(line: str):
+            # On collecte silencieusement pour le .log sur disque,
+            # sans afficher à l'écran (cf. section 4 pour le téléchargement)
             lines.append(line)
-            log_area.code("\n".join(lines[-30:]), language="log")
 
         try:
             if dry_run:
@@ -861,12 +864,7 @@ def page_workflow():
                     seqs = [p for p in src.iterdir()
                             if p.is_dir() and p.name.lower().startswith(subject.lower() + "_")]
                     cb(f"[DRY-RUN] {subject} → {len(seqs)} séquences")
-                    for s in seqs:
-                        dcm = first_dicom_in(s)
-                        if dcm:
-                            m = read_meta(dcm)
-                            cb(f"    └ {s.name} | StudyDate={m.study_date} "
-                               f"Protocol={m.protocol_name}")
+                progress.progress(1.0, text="Terminé")
                 st.success("Simulation terminée — aucun fichier écrit.")
             else:
                 stats = transfer_to_nas(src, nas, animals, log_callback=cb)
@@ -881,12 +879,17 @@ def page_workflow():
                 m4.metric("Err / Warn", f"{len(stats.errors)} / {len(stats.warnings)}")
 
                 if stats.errors:
-                    with st.expander(f"❌ {len(stats.errors)} erreurs", expanded=True):
-                        st.code("\n".join(stats.errors))
+                    st.error(
+                        f"{len(stats.errors)} erreur(s) — voir détails dans le .log "
+                        f"téléchargeable section 4."
+                    )
                 if stats.warnings:
-                    with st.expander(f"⚠️ {len(stats.warnings)} warnings"):
-                        st.code("\n".join(stats.warnings))
-                st.success("Transfert terminé.")
+                    st.warning(
+                        f"{len(stats.warnings)} warning(s) — voir détails dans le .log "
+                        f"téléchargeable section 4."
+                    )
+                if not stats.errors and not stats.warnings:
+                    st.success("Transfert terminé sans erreur ni warning.")
         except Exception as e:
             st.error(f"Erreur lors du transfert : {e}")
 
@@ -926,14 +929,16 @@ def page_workflow():
             st.caption(f"📍 Chemin du dossier NAS : `{nas}`")
 
         log_file = nas / f"{nas.name}.log"
-        lc1, lc2 = st.columns(2)
+        lc1, lc2 = st.columns([1, 2])
         with lc1:
             st.markdown("**📄 Fichier `.log`**")
             if log_file.exists():
                 content = log_file.read_text()
-                st.code(content or "(vide)", language="log")
+                size = len(content.encode())
+                st.caption(f"{len(content.splitlines())} lignes · {size} octets")
                 st.download_button("⬇️ Télécharger .log", data=content,
-                                   file_name=log_file.name, mime="text/plain")
+                                   file_name=log_file.name, mime="text/plain",
+                                   use_container_width=True)
             else:
                 st.info("Pas encore de fichier de log.")
         with lc2:
